@@ -234,281 +234,90 @@ async def outgoing_call(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    """
-    Handles the Twilio <Stream> WebSocket and connects to Ultravox via WebSocket.
-    Includes transcoding audio between Twilio's G.711 µ-law and Ultravox's s16 PCM.
-    """
     await websocket.accept()
-    print('Client connected to /media-stream (Twilio)')
-
-    # Initialize session variables
-    call_sid = None
-    session = None
-    stream_sid = ''
-    uv_ws = None  # Ultravox WebSocket connection
-    twilio_task = None  # Store the Twilio handler task
-
-    # Define handler for Ultravox messages
-    async def handle_ultravox():
-        nonlocal uv_ws, session, stream_sid, call_sid, twilio_task
-        try:
-            async for raw_message in uv_ws:
-                if isinstance(raw_message, bytes):
-                    # Agent audio in PCM s16le
-                    try:
-                        mu_law_bytes = audioop.lin2ulaw(raw_message, 2)
-                        payload_base64 = base64.b64encode(mu_law_bytes).decode('ascii')
-                    except Exception as e:
-                        print(f"Error transcoding PCM to µ-law: {e}")
-                        continue  # Skip this audio frame
-
-                    # Send to Twilio as media payload
-                    try:
-                        await websocket.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "payload": payload_base64
-                            }
-                        }))
-                    except Exception as e:
-                        print(f"Error sending media to Twilio: {e}")
-
-                else:
-                    # Text data message from Ultravox
-                    try:
-                        msg_data = json.loads(raw_message)
-                        # print(f"Received data message from Ultravox: {json.dumps(msg_data)}")
-                    except Exception as e:
-                        print(f"Ultravox non-JSON data: {raw_message}")
-                        continue
-
-                    msg_type = msg_data.get("type") or msg_data.get("eventType")
-
-                    if msg_type == "transcript":
-                        role = msg_data.get("role")
-                        text = msg_data.get("text") or msg_data.get("delta")
-                        final = msg_data.get("final", False)
-
-                        if role and text:
-                            role_cap = role.capitalize()
-                            session['transcript'] += f"{role_cap}: {text}\n"
-                            print(f"{role_cap} says: {text}")
-
-                            if final:
-                                print(f"Transcript for {role_cap} finalized.")
-
-                    elif msg_type == "client_tool_invocation":
-                        toolName = msg_data.get("toolName", "")
-                        invocationId = msg_data.get("invocationId")
-                        parameters = msg_data.get("parameters", {})
-                        print(f"Invoking tool: {toolName} with invocationId: {invocationId} and parameters: {parameters}")
-
-                        if toolName == "question_and_answer":
-                            question = parameters.get('question')
-                            print(f'Arguments passed to question_and_answer tool: {parameters}')
-                            await handle_question_and_answer(uv_ws, invocationId, question)
-                        elif toolName == "schedule_meeting":
-                            print(f'Arguments passed to schedule_meeting tool: {parameters}')
-                            # Validate required parameters
-                            required_params = ["name", "email", "purpose", "datetime", "location"]
-                            missing_params = [param for param in required_params if not parameters.get(param)]
-
-                            if missing_params:
-                                print(f"Missing parameters for schedule_meeting: {missing_params}")
-
-                                # Inform the agent to prompt the user for missing parameters
-                                prompt_message = f"Please provide the following information to schedule your meeting: {', '.join(missing_params)}."
-                                tool_result = {
-                                    "type": "client_tool_result",
-                                    "invocationId": invocationId,
-                                    "result": prompt_message,
-                                    "response_type": "tool-response"
-                                }
-                                await uv_ws.send(json.dumps(tool_result))
-                            else:
-                                await handle_schedule_meeting(uv_ws, session, invocationId, parameters)
-                        
-                        elif toolName == "hangUp":
-                            print("Received hangUp tool invocation")
-                            # Send success response back to the agent
-                            tool_result = {
-                                "type": "client_tool_result",
-                                "invocationId": invocationId,
-                                "result": "Call ended successfully",
-                                "response_type": "tool-response"
-                            }
-                            await uv_ws.send(json.dumps(tool_result))
-                            
-                            # End the call process:
-                            print(f"Ending call (CallSid={call_sid})")
     
-                            # Close Ultravox WebSocket
-                            if uv_ws and uv_ws.state == websockets.protocol.State.OPEN:
-                                await uv_ws.close()
-                            
-                            # End Twilio call
-                            try:
-                                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                                client.calls(call_sid).update(status='completed')
-                                print(f"Successfully ended Twilio call: {call_sid}")
-                            except Exception as e:
-                                print(f"Error ending Twilio call: {e}")
-                            
-                            # Send transcript to N8N and cleanup session
-                            if session:
-                                await send_transcript_to_n8n(session)
-                                sessions.pop(call_sid, None)
-                            return  # Exit the Ultravox handler
-
-                    elif msg_type == "state":
-                        # Handle state messages
-                        state = msg_data.get("state")
-                        if state:
-                            print(f"Agent state: {state}")
-
-                    elif msg_type == "debug":
-                        # Handle debug messages
-                        debug_message = msg_data.get("message")
-                        print(f"Ultravox debug message: {debug_message}")
-                        # Attempt to parse nested messages within the debug message
-                        try:
-                            nested_msg = json.loads(debug_message)
-                            nested_type = nested_msg.get("type")
-
-                            if nested_type == "toolResult":
-                                tool_name = nested_msg.get("toolName")
-                                output = nested_msg.get("output")
-                                print(f"Tool '{tool_name}' result: {output}")
-
-
-                            else:
-                                print(f"Unhandled nested message type within debug: {nested_type}")
-                        except json.JSONDecodeError as e:
-                            print(f"Failed to parse nested message within debug message: {e}. Message: {debug_message}")
-
-                    elif msg_type in LOG_EVENT_TYPES:
-                        print(f"Ultravox event: {msg_type} - {msg_data}")
-                    else:
-                        print(f"Unhandled Ultravox message type: {msg_type} - {msg_data}")
-
-        except Exception as e:
-            print(f"Error in handle_ultravox: {e}")
-            traceback.print_exc()
-
-    # Define handler for Twilio messages
-    async def handle_twilio():
-        nonlocal call_sid, session, stream_sid, uv_ws
-        try:
-            while True:
-                message = await websocket.receive_text()
-                data = json.loads(message)
-
-                if data.get('event') == 'start':
-                    stream_sid = data['start']['streamSid']
-                    call_sid = data['start']['callSid']
-                    custom_parameters = data['start'].get('customParameters', {})
-
-                    print("Twilio event: start")
-                    print("CallSid:", call_sid)
-                    print("StreamSid:", stream_sid)
-                    print("Custom Params:", custom_parameters)
-
-                    # Extract first_message and caller_number
-                    first_message = custom_parameters.get('firstMessage', "Hello, how can I assist you?")
-                    caller_number = custom_parameters.get('callerNumber', 'Unknown')
-
-                    if call_sid and call_sid in sessions:
-                        session = sessions[call_sid]
-                        session['callerNumber'] = caller_number
-                        session['streamSid'] = stream_sid
-                    else:
-                        print(f"Session not found for CallSid: {call_sid}")
-                        await websocket.close()
-                        return
-
-                    print("Caller Number:", caller_number)
-                    print("First Message:", first_message)
-
-                    # Create Ultravox call with first_message
-                    uv_join_url = await create_ultravox_call(
-                        system_prompt=SYSTEM_MESSAGE,
-                        first_message=first_message  # Pass the actual first_message here
-                    )
-
-                    if not uv_join_url:
-                        print("Ultravox joinUrl is empty. Cannot establish WebSocket connection.")
-                        await websocket.close()
-                        return
-
-                    # Connect to Ultravox WebSocket
-                    try:
-                        uv_ws = await websockets.connect(uv_join_url)
-                        print("Ultravox WebSocket connected.")
-                    except Exception as e:
-                        print(f"Error connecting to Ultravox WebSocket: {e}")
-                        traceback.print_exc()
-                        await websocket.close()
-                        return
-
-                    # Start handling Ultravox messages as a separate task
-                    uv_task = asyncio.create_task(handle_ultravox())
-                    print("Started Ultravox handler task.")
-
-                elif data.get('event') == 'media':
-                    # Twilio sends media from user
-                    payload_base64 = data['media']['payload']
-
-                    try:
-                        # Decode base64 to get raw µ-law bytes
-                        mu_law_bytes = base64.b64decode(payload_base64)
-
-                    except Exception as e:
-                        print(f"Error decoding base64 payload: {e}")
-                        continue  # Skip this payload
-
-                    try:
-                        # Transcode µ-law to PCM (s16le)
-                        pcm_bytes = audioop.ulaw2lin(mu_law_bytes, 2)
-                        
-                    except Exception as e:
-                        print(f"Error transcoding µ-law to PCM: {e}")
-                        continue  # Skip this payload
-
-                    # Send PCM bytes to Ultravox
-                    if uv_ws and uv_ws.state == websockets.protocol.State.OPEN:
-                        try:
-                            await uv_ws.send(pcm_bytes)
-                       
-                        except Exception as e:
-                            print(f"Error sending PCM to Ultravox: {e}")
-
-        except WebSocketDisconnect:
-            print(f"Twilio WebSocket disconnected (CallSid={call_sid}).")
-            # Attempt to close Ultravox ws
-            if uv_ws and uv_ws.state == websockets.protocol.State.OPEN:
-                await uv_ws.close()
-            # Post the transcript to N8N
-            if session:
-                await send_transcript_to_n8n(session)
-                sessions.pop(call_sid, None)
-
-        except Exception as e:
-            print(f"Error in handle_twilio: {e}")
-            traceback.print_exc()
-
-    # Start handling Twilio media as a separate task
-    twilio_task = asyncio.create_task(handle_twilio())
-
+    # Get parameters from WebSocket query
+    params = websocket.query_params
+    first_message = params.get("firstMessage", "")
+    caller_number = params.get("callerNumber", "")
+    call_sid = params.get("callSid", "")
+    
+    print(f"WebSocket connected: {call_sid}")
+    
+    # Initialize or get session
+    session = sessions.get(call_sid, {
+        "transcript": "",
+        "callerNumber": caller_number,
+        "callSid": call_sid,
+        "firstMessage": first_message,
+        "streamSid": None,
+        "appointmentData": {
+            "selected_stylist": None,
+            "selected_service": None,
+            "selected_date": None,
+            "selected_time": None
+        }
+    })
+    
+    if call_sid:
+        sessions[call_sid] = session
+    
+    # Create periodic update task
+    update_interval = 10  # segundos
+    periodic_update_task = None
+    
     try:
-        # Wait for the Twilio handler to complete
-        await twilio_task
-    except asyncio.CancelledError:
-        print("Twilio handler task cancelled")
+        # Create Ultravox call
+        uv_join_url = await create_ultravox_call(SYSTEM_MESSAGE, first_message)
+        print(f"Ultravox join URL: {uv_join_url}")
+        
+        # Connect to Ultravox WebSocket
+        async with websockets.connect(uv_join_url) as uv_ws:
+            print("Connected to Ultravox WebSocket")
+            
+            # Start periodic update task
+            periodic_update_task = asyncio.create_task(
+                periodic_conversation_updates(call_sid, update_interval)
+            )
+            
+            # Create tasks for handling Twilio and Ultravox
+            twilio_task = asyncio.create_task(handle_twilio_messages(websocket, uv_ws, session))
+            ultravox_task = asyncio.create_task(handle_ultravox_messages(uv_ws, websocket, session))
+            
+            # Wait for either task to complete
+            done, pending = await asyncio.wait(
+                [twilio_task, ultravox_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel the remaining task
+            for task in pending:
+                task.cancel()
+                
+            # Cancel periodic update task
+            if periodic_update_task:
+                periodic_update_task.cancel()
+                
+            # Send transcript to N8N
+            await send_transcript_to_n8n(session)
+            
+    except websockets.exceptions.ConnectionClosedError:
+        print("WebSocket connection closed")
+    except Exception as e:
+        print(f"Error in media_stream: {e}")
+        traceback.print_exc()
     finally:
-        # Ensure everything is cleaned up
-        if session and call_sid:
-            sessions.pop(call_sid, None)
+        # Cancel periodic update task if it exists
+        if periodic_update_task:
+            periodic_update_task.cancel()
+            
+        # Clean up
+        if call_sid in sessions:
+            # Enviar una última actualización antes de cerrar
+            await periodic_conversation_update(call_sid)
+            
+            # Enviar transcripción completa
+            await send_transcript_to_n8n(sessions[call_sid])
 
 
 #
@@ -1034,6 +843,202 @@ async def update_appointment_status(session_id: str, field: str, value: str):
             return False
     
     return False
+
+#
+# Actualiza periódicamente el estado de la conversación a N8N
+#
+async def periodic_conversation_update(session_id):
+    """
+    Envía actualizaciones periódicas del estado de la conversación a N8N
+    """
+    if session_id not in sessions:
+        return
+        
+    session = sessions[session_id]
+    
+    # Extraer información de la transcripción
+    transcript_data = await extract_appointment_info_from_transcript(session["transcript"])
+    
+    # Actualizar datos de la sesión con la información extraída
+    if "appointmentData" not in session:
+        session["appointmentData"] = {
+            "selected_stylist": None,
+            "selected_service": None,
+            "selected_date": None,
+            "selected_time": None
+        }
+    
+    # Actualizar solo los valores que son None
+    appointment_data = session["appointmentData"]
+    updated = False
+    
+    for key, value in transcript_data.items():
+        if key in appointment_data and value is not None:
+            if appointment_data[key] != value:
+                appointment_data[key] = value
+                updated = True
+    
+    # Si se actualizó algún valor, enviar a N8N
+    if updated:
+        update_data = {
+            "route": "conversation_update",
+            "number": session.get("callerNumber", "Unknown"),
+            "call_id": session_id,
+            "timestamp": datetime.now().isoformat(),
+            "conversation_state": {
+                "appointment_data": appointment_data,
+                "customer_info": {
+                    "name": transcript_data.get("customer_name", ""),
+                    "email": transcript_data.get("customer_email", ""),
+                    "phone": session.get("callerNumber", "")
+                },
+                "transcript_length": len(session["transcript"])
+            }
+        }
+        
+        # Enviar actualización a N8N
+        await send_to_webhook(update_data)
+        print(f"Sent conversation update to N8N: {json.dumps(update_data, indent=2)}")
+
+#
+# Función para ejecutar actualizaciones periódicas
+#
+async def periodic_conversation_updates(session_id, interval):
+    """
+    Ejecuta actualizaciones periódicas del estado de la conversación
+    """
+    while True:
+        await periodic_conversation_update(session_id)
+        await asyncio.sleep(interval)
+
+#
+# Manejar mensajes de Twilio
+#
+async def handle_twilio_messages(websocket, uv_ws, session):
+    """
+    Maneja los mensajes entrantes desde Twilio
+    """
+    try:
+        while True:
+            message = await websocket.receive_text()
+            data = json.loads(message)
+
+            if data.get('event') == 'start':
+                stream_sid = data['start']['streamSid']
+                call_sid = data['start']['callSid']
+                
+                # Actualizar la sesión con el stream_sid
+                session['streamSid'] = stream_sid
+                print(f"Twilio stream started: {stream_sid} for call {call_sid}")
+                
+            elif data.get('event') == 'media':
+                # Twilio envía audio del usuario
+                payload_base64 = data['media']['payload']
+
+                try:
+                    # Decodificar base64 para obtener bytes µ-law
+                    mu_law_bytes = base64.b64decode(payload_base64)
+                    # Transcodificar µ-law a PCM (s16le)
+                    pcm_bytes = audioop.ulaw2lin(mu_law_bytes, 2)
+                    # Enviar bytes PCM a Ultravox
+                    await uv_ws.send(pcm_bytes)
+                except Exception as e:
+                    print(f"Error procesando audio: {e}")
+                    
+            elif data.get('event') == 'stop':
+                print(f"Twilio stream stopped: {data.get('streamSid')}")
+                return  # Terminar el manejador
+                
+    except WebSocketDisconnect:
+        print("Twilio WebSocket desconectado")
+    except Exception as e:
+        print(f"Error en handle_twilio_messages: {e}")
+        traceback.print_exc()
+
+#
+# Manejar mensajes de Ultravox
+#
+async def handle_ultravox_messages(uv_ws, websocket, session):
+    """
+    Maneja los mensajes entrantes desde Ultravox
+    """
+    try:
+        async for raw_message in uv_ws:
+            if isinstance(raw_message, bytes):
+                # Audio del agente en PCM s16le
+                try:
+                    # Transcodificar PCM a µ-law
+                    mu_law_bytes = audioop.lin2ulaw(raw_message, 2)
+                    payload_base64 = base64.b64encode(mu_law_bytes).decode('ascii')
+                    
+                    # Enviar a Twilio como carga útil de medios
+                    await websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": session.get("streamSid", ""),
+                        "media": {
+                            "payload": payload_base64
+                        }
+                    }))
+                except Exception as e:
+                    print(f"Error procesando audio del agente: {e}")
+                    
+            else:
+                # Mensaje de texto de Ultravox
+                try:
+                    msg_data = json.loads(raw_message)
+                    msg_type = msg_data.get("type") or msg_data.get("eventType")
+                    
+                    if msg_type == "transcript":
+                        role = msg_data.get("role")
+                        text = msg_data.get("text") or msg_data.get("delta")
+                        final = msg_data.get("final", False)
+                        
+                        if role and text:
+                            role_cap = role.capitalize()
+                            session['transcript'] += f"{role_cap}: {text}\n"
+                            print(f"{role_cap} dice: {text}")
+                            
+                    elif msg_type == "client_tool_invocation":
+                        toolName = msg_data.get("toolName", "")
+                        invocationId = msg_data.get("invocationId")
+                        parameters = msg_data.get("parameters", {})
+                        print(f"Invocando herramienta: {toolName} con ID: {invocationId}")
+                        
+                        if toolName == "question_and_answer":
+                            question = parameters.get('question')
+                            await handle_question_and_answer(uv_ws, invocationId, question)
+                            
+                        elif toolName == "schedule_meeting":
+                            await handle_schedule_meeting(uv_ws, session, invocationId, parameters)
+                            
+                        elif toolName == "hangUp":
+                            print("Recibida solicitud de colgar")
+                            # Enviar respuesta de éxito al agente
+                            tool_result = {
+                                "type": "tool-response",
+                                "invocationId": invocationId,
+                                "result": "Llamada finalizada con éxito"
+                            }
+                            await uv_ws.send(json.dumps(tool_result))
+                            
+                            # Finalizar la llamada de Twilio
+                            try:
+                                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                                client.calls(session.get("callSid")).update(status='completed')
+                                print(f"Llamada de Twilio finalizada: {session.get('callSid')}")
+                            except Exception as e:
+                                print(f"Error al finalizar la llamada: {e}")
+                            
+                            return  # Salir del manejador
+                            
+                except Exception as e:
+                    print(f"Error procesando mensaje de Ultravox: {e}")
+                    
+    except websockets.exceptions.ConnectionClosedError:
+        print("Conexión WebSocket de Ultravox cerrada")
+    except Exception as e:
+        print(f"Error en handle_ultravox_messages: {e}")
+        traceback.print_exc()
 
 #
 # Run app via Uvicorn
