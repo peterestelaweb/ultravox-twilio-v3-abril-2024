@@ -686,58 +686,95 @@ async def handle_question_and_answer(uv_ws, invocationId: str, question: str):
 async def handle_schedule_meeting(uv_ws, session, invocationId: str, parameters):
     """
     Uses N8N to finalize a meeting schedule.
+    Parameters expected:
+    - selected_stylist: Nombre del estilista
+    - selected_service: Servicio solicitado
+    - selected_date: Fecha (YYYY-MM-DD)
+    - selected_time: Hora (HH:mm)
     """
     try:
         # Extract parameters
-        name = parameters.get('name', '')
-        service = parameters.get('service', '')
-        date_time = parameters.get('datetime', '')
-        stylist = parameters.get('stylist', '')
+        stylist = parameters.get('selected_stylist', '')
+        service = parameters.get('selected_service', '')
+        date = parameters.get('selected_date', '')
+        time = parameters.get('selected_time', '')
+        
+        # Validate parameters
+        if not all([stylist, service, date, time]):
+            raise ValueError("Faltan parámetros requeridos para la cita")
         
         # Get service duration
-        duration = SERVICE_DURATIONS.get(service.upper().replace(' ', '_'), 30)
+        service_key = service.upper().replace(' ', '_')
+        duration = SERVICE_DURATIONS.get(service_key, 30)
         
         # Get calendar ID based on stylist
-        calendar_id = CALENDARS_LIST.get(stylist.upper(), '')
+        stylist_key = stylist.upper()
+        calendar_id = CALENDARS_LIST.get(stylist_key, '')
+        if not calendar_id:
+            raise ValueError(f"Estilista no encontrado: {stylist}")
+        
+        # Format datetime for N8N
+        appointment_datetime = f"{date} {time}"
         
         # Prepare scheduling data
         scheduling_data = {
-            "name": name,
-            "service": service,
-            "datetime": date_time,
-            "duration": duration,
-            "stylist": stylist,
-            "calendar_id": calendar_id,
-            "phone": session.get("callerNumber", "")
+            "appointment_details": {
+                "stylist": stylist,
+                "service": service,
+                "date": date,
+                "time": time,
+                "duration": duration,
+                "calendar_id": calendar_id
+            },
+            "customer_details": {
+                "phone": session.get("callerNumber", ""),
+                "call_id": session.get("callSid", "")
+            }
         }
 
         # Send to N8N for processing
-        response = await send_to_webhook({
-            "route": "schedule",
+        webhook_response = await send_to_webhook({
+            "route": "schedule_appointment",
             "data": scheduling_data
         })
 
-        # Return the final outcome to Ultravox
-        tool_result = {
-            "type": "client_tool_result",
-            "invocationId": invocationId,
-            "result": "Meeting scheduled successfully",
-            "response_type": "tool-response"
-        }
-        await uv_ws.send(json.dumps(tool_result))
-        print(f"Sent schedule_meeting result to Ultravox: Meeting scheduled successfully")
+        try:
+            response_data = json.loads(webhook_response)
+            confirmation_status = response_data.get('status', 'error')
+            message = response_data.get('message', 'No se pudo procesar la solicitud')
+
+            # Return the result to Ultravox
+            tool_result = {
+                "type": "tool-response",
+                "invocationId": invocationId,
+                "result": {
+                    "status": confirmation_status,
+                    "message": message,
+                    "appointment": {
+                        "stylist": stylist,
+                        "service": service,
+                        "date": date,
+                        "time": time,
+                        "duration": duration
+                    }
+                }
+            }
+            
+            await uv_ws.send(json.dumps(tool_result))
+            print(f"Sent schedule_meeting result to Ultravox: {message}")
+
+        except json.JSONDecodeError:
+            raise ValueError("Error al procesar la respuesta de N8N")
 
     except Exception as e:
-        print(f"Error scheduling meeting: {e}")
-        # Send error result back to Ultravox
+        error_message = f"Error al programar la cita: {str(e)}"
+        print(error_message)
         error_result = {
-            "type": "client_tool_result",
+            "type": "tool-response",
             "invocationId": invocationId,
-            "error_type": "implementation-error",
-            "error_message": "An error occurred while scheduling your meeting."
+            "error": error_message
         }
         await uv_ws.send(json.dumps(error_result))
-        print("Sent error message for schedule_meeting to Ultravox.")
 
 #
 # Send entire transcript to N8N (end of call)
