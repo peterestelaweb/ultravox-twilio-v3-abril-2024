@@ -4,7 +4,7 @@ from fastapi.responses import Response
 from prompts import SYSTEM_MESSAGE
 from dotenv import load_dotenv
 from twilio.rest import Client
-from datetime import datetime
+from datetime import datetime, timedelta
 from pinecone import Pinecone
 import websockets
 import traceback
@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 
 load_dotenv(override=True)
 
@@ -803,14 +804,162 @@ async def handle_schedule_meeting(uv_ws, session, invocationId: str, parameters)
         await uv_ws.send(json.dumps(error_result))
 
 #
+# Analizar la transcripción para extraer información
+#
+async def extract_appointment_info_from_transcript(transcript):
+    """
+    Analiza la transcripción para extraer información sobre la cita
+    """
+    appointment_info = {
+        "selected_stylist": None,
+        "selected_service": None,
+        "selected_date": None,
+        "selected_time": None,
+        "customer_name": None,
+        "customer_email": None
+    }
+    
+    # Lista de estilistas para buscar en la transcripción
+    stylists = ["Maria", "Carlos", "Ana", "Jose", "Laura", "Elena", "Lena"]
+    
+    # Lista de servicios para buscar en la transcripción
+    services = ["corte de pelo", "corte con secado", "corte sin secado", 
+                "mechas", "balaix", "color", "secado", "queratina", "tratamiento"]
+    
+    # Patrones para fechas y horas
+    days = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    
+    # Analizar línea por línea
+    lines = transcript.lower().split('\n')
+    for line in lines:
+        # Buscar estilista
+        if appointment_info["selected_stylist"] is None:
+            for stylist in stylists:
+                if stylist.lower() in line.lower():
+                    appointment_info["selected_stylist"] = stylist
+                    break
+        
+        # Buscar servicio
+        if appointment_info["selected_service"] is None:
+            for service in services:
+                if service in line.lower():
+                    appointment_info["selected_service"] = service
+                    break
+        
+        # Buscar día
+        if appointment_info["selected_date"] is None:
+            for day in days:
+                if day in line.lower():
+                    # Convertir día de la semana a fecha
+                    today = datetime.now()
+                    weekday_today = today.weekday()  # 0 = lunes, 6 = domingo
+                    day_index = days.index(day)  # 0 = lunes, 6 = domingo
+                    
+                    # Calcular días hasta el día deseado
+                    days_until = (day_index - weekday_today) % 7
+                    if days_until == 0:
+                        days_until = 7  # Si es el mismo día, ir a la próxima semana
+                    
+                    # Calcular la fecha
+                    appointment_date = today + datetime.timedelta(days=days_until)
+                    appointment_info["selected_date"] = appointment_date.strftime("%Y-%m-%d")
+                    break
+        
+        # Buscar hora
+        if appointment_info["selected_time"] is None:
+            # Patrones comunes de hora
+            time_patterns = [
+                r'(\d{1,2})(?:\s*)?(?::|h)(?:\s*)?(\d{2})',  # 17:00, 5:30, 17h00
+                r'(\d{1,2})(?:\s+)?(?:de la|en la|por la)(?:\s+)?(mañana|tarde|noche)',  # 5 de la tarde
+                r'a las (\d{1,2})'  # a las 5
+            ]
+            
+            for pattern in time_patterns:
+                matches = re.findall(pattern, line.lower())
+                if matches:
+                    # Convertir a formato HH:MM
+                    if "mañana" in str(matches) or "tarde" in str(matches) or "noche" in str(matches):
+                        hour = int(matches[0][0])
+                        period = matches[0][1]
+                        
+                        # Ajustar hora según período
+                        if period == "tarde" and hour < 12:
+                            hour += 12
+                        elif period == "noche" and hour < 12:
+                            hour += 12
+                        
+                        appointment_info["selected_time"] = f"{hour:02d}:00"
+                    else:
+                        # Formato HH:MM
+                        if len(matches[0]) >= 2:
+                            hour = int(matches[0][0])
+                            minute = matches[0][1] if len(matches[0]) > 1 else "00"
+                            
+                            # Ajustar para PM si es probable
+                            if "tarde" in line.lower() or "noche" in line.lower() and hour < 12:
+                                hour += 12
+                                
+                            appointment_info["selected_time"] = f"{hour:02d}:{minute}"
+                        else:
+                            hour = int(matches[0])
+                            # Ajustar para PM si es probable
+                            if "tarde" in line.lower() or "noche" in line.lower() and hour < 12:
+                                hour += 12
+                            appointment_info["selected_time"] = f"{hour:02d}:00"
+                    break
+        
+        # Buscar nombre del cliente
+        if "mi nombre es" in line.lower() and appointment_info["customer_name"] is None:
+            name_match = re.search(r'mi nombre es\s+([a-zA-Z]+)', line.lower())
+            if name_match:
+                appointment_info["customer_name"] = name_match.group(1).capitalize()
+        
+        # Buscar correo electrónico
+        if "@" in line and "." in line and appointment_info["customer_email"] is None:
+            email_match = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', line.lower().replace(" arroba ", "@").replace(" punto ", "."))
+            if email_match:
+                appointment_info["customer_email"] = email_match.group(1)
+    
+    return appointment_info
+
+#
 # Send entire transcript to N8N (end of call)
 #
 async def send_transcript_to_n8n(session):
     print("Full Transcript:\n", session['transcript'])
+    
+    # Extraer las variables de la sesión
+    appointment_data = session.get("appointmentData", {
+        "selected_stylist": None,
+        "selected_service": None,
+        "selected_date": None,
+        "selected_time": None
+    })
+    
+    # Extraer información de la transcripción
+    transcript_data = await extract_appointment_info_from_transcript(session["transcript"])
+    
+    # Si alguna variable es None, intentar actualizarla con datos de la transcripción
+    for key, value in transcript_data.items():
+        if key in appointment_data and appointment_data[key] is None and value is not None:
+            appointment_data[key] = value
+    
+    # Enviar transcripción y datos de la cita
     await send_to_webhook({
         "route": "2",
         "number": session.get("callerNumber", "Unknown"),
-        "data": session["transcript"]
+        "data": session["transcript"],
+        "appointment_data": appointment_data,
+        "customer_info": {
+            "name": transcript_data.get("customer_name", ""),
+            "email": transcript_data.get("customer_email", ""),
+            "phone": session.get("callerNumber", "")
+        },
+        "call_details": {
+            "call_id": session.get("callSid", ""),
+            "end_time": datetime.now().isoformat(),
+            "call_duration": session.get("callDetails", {}).get("CallDuration", "0")
+        }
     })
 
 #
