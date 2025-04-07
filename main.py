@@ -98,15 +98,28 @@ async def incoming_call(request: Request):
     first_message = "Hola, soy Sara de Peluquería Estilo. ¿En qué puedo ayudarte hoy?"
     print("Fetching N8N ...")
     try:
+        # Preparar datos iniciales de la sesión
+        session_data = {
+            "route": "1",
+            "number": caller_number,
+            "call_details": {
+                "call_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "initial_state": {
+                    "selected_stylist": None,
+                    "selected_service": None,
+                    "selected_date": None,
+                    "selected_time": None
+                }
+            }
+        }
+
         webhook_response = requests.post(
             N8N_WEBHOOK_URL,
             headers={"Content-Type": "application/json"},
-            json={
-                "route": "1",
-                "number": caller_number,
-                "data": "empty"
-            }
+            json=session_data
         )
+        
         if webhook_response.ok:
             response_text = webhook_response.text
             try:
@@ -121,13 +134,19 @@ async def incoming_call(request: Request):
     except Exception as e:
         print(f"Error al enviar datos al webhook de N8N: {e}")
 
-    # Save session
+    # Save session with initial appointment data
     session = {
         "transcript": "",
         "callerNumber": caller_number,
         "callDetails": twilio_params,
         "firstMessage": first_message,
-        "streamSid": None
+        "streamSid": None,
+        "appointmentData": {
+            "selected_stylist": None,
+            "selected_service": None,
+            "selected_date": None,
+            "selected_time": None
+        }
     }
     sessions[session_id] = session
 
@@ -703,6 +722,13 @@ async def handle_schedule_meeting(uv_ws, session, invocationId: str, parameters)
         if not all([stylist, service, date, time]):
             raise ValueError("Faltan parámetros requeridos para la cita")
         
+        # Update appointment status in session and N8N
+        session_id = session.get("callSid", "")
+        await update_appointment_status(session_id, "selected_stylist", stylist)
+        await update_appointment_status(session_id, "selected_service", service)
+        await update_appointment_status(session_id, "selected_date", date)
+        await update_appointment_status(session_id, "selected_time", time)
+        
         # Get service duration
         service_key = service.upper().replace(' ', '_')
         duration = SERVICE_DURATIONS.get(service_key, 30)
@@ -728,7 +754,7 @@ async def handle_schedule_meeting(uv_ws, session, invocationId: str, parameters)
             },
             "customer_details": {
                 "phone": session.get("callerNumber", ""),
-                "call_id": session.get("callSid", "")
+                "call_id": session_id
             }
         }
 
@@ -816,6 +842,49 @@ async def send_to_webhook(payload):
         error_msg = f"Error sending data to N8N webhook: {str(e)}"
         print(error_msg)
         return json.dumps({"error": error_msg})
+
+#
+# Actualiza el estado de la cita y notifica a N8N
+#
+async def update_appointment_status(session_id: str, field: str, value: str):
+    """
+    Actualiza el estado de la cita y notifica a N8N
+    """
+    if session_id in sessions:
+        session = sessions[session_id]
+        
+        # Actualizar el campo específico
+        if "appointmentData" not in session:
+            session["appointmentData"] = {
+                "selected_stylist": None,
+                "selected_service": None,
+                "selected_date": None,
+                "selected_time": None
+            }
+        
+        session["appointmentData"][field] = value
+        
+        # Notificar a N8N sobre el cambio
+        try:
+            update_data = {
+                "route": "appointment_update",
+                "number": session.get("callerNumber", "Unknown"),
+                "call_id": session_id,
+                "update_type": field,
+                "update_value": value,
+                "current_state": session["appointmentData"]
+            }
+            
+            # Enviar actualización a N8N
+            webhook_response = await send_to_webhook(update_data)
+            print(f"Appointment status update sent to N8N: {field} = {value}")
+            
+            return True
+        except Exception as e:
+            print(f"Error updating appointment status in N8N: {e}")
+            return False
+    
+    return False
 
 #
 # Run app via Uvicorn
