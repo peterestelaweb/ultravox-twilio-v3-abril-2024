@@ -553,7 +553,7 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
         "temperature":0.1,
         "initialMessages": [
             {
-                "role": "MESSAGE_ROLE_USER",  
+                "role": "MESSAGE_ROLE_ASSISTANT",  
                 "text": first_message
             }
         ],
